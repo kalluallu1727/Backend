@@ -1,0 +1,28 @@
+{
+  "name": "ivr-backend",
+  "version": "1.0.0",
+  "main": "server.js",
+  "scripts": {
+    "start": "node --max-old-space-size=380 server.js",
+    "test": "jest --runInBand"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.101.1",
+    "cors": "^2.8.6",
+    "dotenv": "^17.4.1",
+    "express": "^4.22.1",
+    "mammoth": "^1.8.0",
+    "multer": "^2.0.0",
+    "pdf-parse": "^1.1.1",
+    "twilio": "^5.4.0"
+  },
+  "devDependencies": {
+    "jest": "^30.3.0",
+    "supertest": "^7.2.2"
+  },
+  "jest": {
+    "modulePathIgnorePatterns": [
+      "<rootDir>/ivr-backend/"
+    ]
+  }
+}
