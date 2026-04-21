@@ -18,7 +18,6 @@ const twilio   = require("twilio");
 const { analyzeCustomerSpeech }                            = require("./decisionEngine");
 const { generateEmbedding, searchKnowledge, generateSuggestedReply } = require("./ragService");
 const { upload, extractText, chunkText }                   = require("./uploadService");
-const { runMigrations }                                    = require("./migrate");
 require("dotenv").config({ quiet: true });
 
 // ── App + HTTP server ─────────────────────────────────────────
@@ -686,7 +685,7 @@ function startServer(p) {
 }
 
 if (require.main === module) {
-  runMigrations().then(() => startServer(port));
+  startServer(port);
 }
 
 module.exports = { app, server };
