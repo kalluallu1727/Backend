@@ -87,6 +87,20 @@ function escapeXml(value) {
     .replace(/'/g, "&apos;");
 }
 
+function saveIvrMessage(callId, content) {
+  const text = String(content || "").trim();
+  if (!callId || !text) return;
+
+  supabase
+    .from("messages")
+    .insert({ call_id: callId, role: "ivr", content: text })
+    .then(({ error }) => {
+      if (error) {
+        console.error("[ivr] Message insert error:", error.message);
+      }
+    });
+}
+
 function buildPhoneVariants(rawPhone) {
   const digitsOnly = String(rawPhone || "").replace(/\D/g, "");
   if (!digitsOnly) return [rawPhone].filter(Boolean);
@@ -131,6 +145,8 @@ async function lookupCustomerByPhone(rawPhone) {
 // Twilio's <Start><Transcription> handles speech-to-text natively.
 // Final transcripts are POSTed to /api/transcription by Twilio.
 function customerConferenceTwiml(callId) {
+  saveIvrMessage(callId, "Please hold while we connect you to an agent.");
+
   const transcriptionUrl = escapeXml(`${BASE_URL}/api/transcription?call_id=${callId}&role=customer`);
   const statusUrl        = escapeXml(`${BASE_URL}/api/conference-status?call_id=${callId}`);
   const room             = `room-${callId}`;
@@ -390,7 +406,7 @@ async function fetchCustomerBillingContext(customerId, customerPhone, customerNa
     const { data, error } = await query;
     if (error || !data || data.length === 0) return null;
 
-    return data.map((row) => {
+    const summary = data.map((row) => {
       const parts = [];
       const month  = row.bill_month  || row.month         || row.billing_period || row.period || null;
       const amount = row.amount      || row.total_amount  || row.bill_amount    || null;
@@ -411,6 +427,19 @@ async function fetchCustomerBillingContext(customerId, customerPhone, customerNa
       }
       return parts.join(", ");
     }).filter(Boolean).join("\n");
+
+    const latest = data[0] || null;
+    const latestBill = latest
+      ? {
+          month: latest.bill_month || latest.month || latest.billing_period || latest.period || null,
+          amount: latest.amount || latest.total_amount || latest.bill_amount || null,
+          due_date: latest.due_date || latest.due || null,
+          status: latest.status || latest.payment_status || null,
+          paid_date: latest.paid_date || latest.payment_date || null,
+        }
+      : null;
+
+    return { summary, latestBill };
   } catch {
     return null;
   }
@@ -508,14 +537,19 @@ app.post("/api/transcription", async (req, res) => {
 
     // ── Step 2: generate suggested reply and update the row (non-blocking for step 1) ──
     try {
-      const [contextChunks, billingContext] = await Promise.all([
+      const [contextChunks, billingInfo] = await Promise.all([
         embedding ? searchKnowledge(supabase, embedding) : Promise.resolve([]),
         fetchCustomerBillingContext(null, customerPhone, customerName),
       ]);
 
-      if (billingContext) console.log(`[analysis] billing context found for ${customerName || customerPhone}`);
+      if (billingInfo?.summary) console.log(`[analysis] billing context found for ${customerName || customerPhone}`);
 
-      const customerData  = { name: customerName, tier, billingContext };
+      const customerData  = {
+        name: customerName,
+        tier,
+        billingContext: billingInfo?.summary || null,
+        latestBill: billingInfo?.latestBill || null,
+      };
       const suggestedReply = await generateSuggestedReply(transcript, contextChunks, tier, customerData);
 
       const analysisId = savedRows?.[0]?.id;
