@@ -87,6 +87,81 @@ function escapeXml(value) {
     .replace(/'/g, "&apos;");
 }
 
+function saveIvrMessage(callId, content) {
+  const text = String(content || "").trim();
+  if (!callId || !text) return;
+  supabase
+    .from("messages")
+    .insert({ call_id: callId, role: "ivr", content: text })
+    .then(({ error }) => {
+      if (error) console.error("[ivr] Message insert error:", error.message);
+    });
+}
+
+function buildIvrMenuTwiml(callId, isCustomerKnown, retry = false) {
+  const actionUrl = escapeXml(`${BASE_URL}/api/twilio/ivr/select?call_id=${callId}`);
+  const retryUrl = escapeXml(`${BASE_URL}/api/twilio/ivr/select?call_id=${callId}&retry=1`);
+  const retryLine = retry ? `<Say voice="alice">Sorry, I did not get a valid option.</Say>` : "";
+  const verificationLine = isCustomerKnown
+    ? `<Say voice="alice">Customer verification complete from your registered number.</Say>`
+    : `<Say voice="alice">Customer verification step complete.</Say>`;
+
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  ${verificationLine}
+  ${retryLine}
+  <Gather input="dtmf" numDigits="1" timeout="6" action="${actionUrl}" method="POST">
+    <Say voice="alice">Press 1 for billing.</Say>
+    <Say voice="alice">Press 2 for service related questions.</Say>
+    <Say voice="alice">Press 3 for General Queries.</Say>
+  </Gather>
+  <Redirect method="POST">${retryUrl}</Redirect>
+</Response>`;
+}
+
+function buildProblemCaptureTwiml(callId, optionDigit) {
+  const actionUrl = escapeXml(`${BASE_URL}/api/twilio/ivr/problem?call_id=${callId}&ivr_option=${optionDigit}`);
+  const timeoutUrl = escapeXml(`${BASE_URL}/api/twilio/ivr/problem?call_id=${callId}&ivr_option=${optionDigit}&timeout=1`);
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Gather input="speech" speechTimeout="auto" timeout="7" action="${actionUrl}" method="POST">
+    <Say voice="alice">In a few words, please tell me your problem or query.</Say>
+  </Gather>
+  <Redirect method="POST">${timeoutUrl}</Redirect>
+</Response>`;
+}
+
+function ivrLabelFromDigit(digit) {
+  if (digit === "1") return "Billing";
+  if (digit === "2") return "Service Related Questions";
+  if (digit === "3") return "General Queries";
+  return "General";
+}
+
+function dialAgentForCall(callId) {
+  if (!twilioClient || !TWILIO_PHONE_NUMBER) {
+    console.warn("[voice] ERROR: Twilio client not configured — agent NOT dialled.");
+    console.warn(`[voice]   TWILIO_ACCOUNT_SID : ${TWILIO_ACCOUNT_SID ? "set" : "MISSING"}`);
+    console.warn(`[voice]   TWILIO_AUTH_TOKEN  : ${TWILIO_AUTH_TOKEN  ? "set" : "MISSING"}`);
+    console.warn(`[voice]   TWILIO_PHONE_NUMBER: ${TWILIO_PHONE_NUMBER ? "set" : "MISSING"}`);
+    return;
+  }
+  const agentUrl = `${BASE_URL}/api/twilio/agent?call_id=${callId}`;
+  console.log(`[voice] Dialling agent → client:agent`);
+  console.log(`[voice] Agent TwiML URL : ${agentUrl}`);
+  twilioClient.calls.create({
+    to:   "client:agent",
+    from: TWILIO_PHONE_NUMBER,
+    url:  agentUrl,
+  }).then((call) => {
+    console.log(`[voice] Agent call created ✓ SID=${call.sid}`);
+  }).catch((err) => {
+    console.error(`[voice] Agent dial FAILED: ${err.message}`);
+    console.error(`[voice] Twilio error code : ${err.code || "n/a"}`);
+    console.error(`[voice] Twilio more info  : ${err.moreInfo || "n/a"}`);
+  });
+}
+
 function buildPhoneVariants(rawPhone) {
   const digitsOnly = String(rawPhone || "").replace(/\D/g, "");
   if (!digitsOnly) return [rawPhone].filter(Boolean);
@@ -233,35 +308,43 @@ app.post("/api/twilio/voice", async (req, res) => {
       else console.log(`[voice] Call inserted in DB ✓`);
     });
 
-    // Dial agent browser (laptop dashboard)
-    if (twilioClient && TWILIO_PHONE_NUMBER) {
-      const agentUrl = `${BASE_URL}/api/twilio/agent?call_id=${callId}`;
-      console.log(`[voice] Dialling agent → client:agent`);
-      console.log(`[voice] Agent TwiML URL : ${agentUrl}`);
-      twilioClient.calls.create({
-        to:   "client:agent",
-        from: TWILIO_PHONE_NUMBER,
-        url:  agentUrl,
-      }).then((call) => {
-        console.log(`[voice] Agent call created ✓ SID=${call.sid}`);
-      }).catch((err) => {
-        console.error(`[voice] Agent dial FAILED: ${err.message}`);
-        console.error(`[voice] Twilio error code : ${err.code || "n/a"}`);
-        console.error(`[voice] Twilio more info  : ${err.moreInfo || "n/a"}`);
-      });
-    } else {
-      console.warn("[voice] ERROR: Twilio client not configured — agent NOT dialled.");
-      console.warn(`[voice]   TWILIO_ACCOUNT_SID : ${TWILIO_ACCOUNT_SID ? "set" : "MISSING"}`);
-      console.warn(`[voice]   TWILIO_AUTH_TOKEN  : ${TWILIO_AUTH_TOKEN  ? "set" : "MISSING"}`);
-      console.warn(`[voice]   TWILIO_PHONE_NUMBER: ${TWILIO_PHONE_NUMBER ? "set" : "MISSING"}`);
-    }
-
-    res.send(customerConferenceTwiml(callId));
-    console.log(`[voice] Customer TwiML sent ✓`);
+    saveIvrMessage(callId, customer ? "IVR_VERIFICATION:Verified customer from registered number." : "IVR_VERIFICATION:Verification step completed.");
+    res.send(buildIvrMenuTwiml(callId, Boolean(customer)));
+    console.log(`[voice] IVR menu TwiML sent ✓`);
   } catch (error) {
     console.error("[voice] Unexpected error:", error.message);
-    res.send(customerConferenceTwiml(callId));
+    res.send(buildIvrMenuTwiml(callId, false));
   }
+});
+
+app.post("/api/twilio/ivr/select", (req, res) => {
+  res.set("Content-Type", "text/xml");
+  const callId = String(req.query.call_id || "").trim();
+  const digit = String(req.body.Digits || "").trim();
+  if (!callId) return res.send("<Response><Hangup/></Response>");
+
+  const optionLabel = ivrLabelFromDigit(digit);
+  if (!["1", "2", "3"].includes(digit)) {
+    return res.send(buildIvrMenuTwiml(callId, false, true));
+  }
+
+  saveIvrMessage(callId, `IVR_SELECTION:#${digit} ${optionLabel}`);
+  res.send(buildProblemCaptureTwiml(callId, digit));
+});
+
+app.post("/api/twilio/ivr/problem", (req, res) => {
+  res.set("Content-Type", "text/xml");
+  const callId = String(req.query.call_id || "").trim();
+  const optionDigit = String(req.query.ivr_option || "").trim();
+  const spoken = String(req.body.SpeechResult || "").replace(/\s+/g, " ").trim();
+  if (!callId) return res.send("<Response><Hangup/></Response>");
+
+  const summary = spoken || "No problem summary captured.";
+  saveIvrMessage(callId, `IVR_SUMMARY:${summary}`);
+  saveIvrMessage(callId, `IVR_SELECTION:#${optionDigit || "-"} ${ivrLabelFromDigit(optionDigit)}`);
+
+  dialAgentForCall(callId);
+  res.send(customerConferenceTwiml(callId));
 });
 
 // -- Agent leg TwiML (called by Twilio when agent answers) ----
