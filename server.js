@@ -101,6 +101,112 @@ function saveIvrMessage(callId, content) {
     });
 }
 
+const IVR_OPTIONS = {
+  "1": { label: "Billing", routeKey: "billing" },
+  "2": { label: "New Lines", routeKey: "sales" },
+  "3": { label: "Service Questions", routeKey: "support" },
+};
+
+const AGENT_IDENTITY_BY_ROUTE = {
+  billing: process.env.AGENT_IDENTITY_BILLING || "agent_billing",
+  sales: process.env.AGENT_IDENTITY_SALES || "agent_sales",
+  support: process.env.AGENT_IDENTITY_SUPPORT || "agent_support",
+};
+
+function getRouteForOption(optionDigit) {
+  const option = IVR_OPTIONS[String(optionDigit || "").trim()];
+  if (!option) {
+    return {
+      optionDigit: null,
+      optionLabel: "General",
+      routeKey: "general",
+      agentIdentity: "agent",
+      queueLabel: "General Queue",
+    };
+  }
+  return {
+    optionDigit: String(optionDigit),
+    optionLabel: option.label,
+    routeKey: option.routeKey,
+    agentIdentity: AGENT_IDENTITY_BY_ROUTE[option.routeKey] || "agent",
+    queueLabel: `${option.label} Queue`,
+  };
+}
+
+function buildIvrMenuTwiml(callId, retry = false) {
+  const actionUrl = escapeXml(`${BASE_URL}/api/twilio/ivr/select?call_id=${callId}`);
+  const retryLine = retry ? `<Say voice="alice">Sorry, I did not get a valid option.</Say>` : "";
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  ${retryLine}
+  <Gather input="dtmf"
+          numDigits="1"
+          timeout="6"
+          action="${actionUrl}"
+          method="POST">
+    <Say voice="alice">Welcome to support.</Say>
+    <Say voice="alice">Press 1 for billing.</Say>
+    <Say voice="alice">Press 2 for new lines.</Say>
+    <Say voice="alice">Press 3 for service related questions.</Say>
+  </Gather>
+  <Redirect method="POST">${actionUrl}&retry=1</Redirect>
+</Response>`;
+}
+
+function buildProblemCaptureTwiml(callId, optionDigit) {
+  const actionUrl = escapeXml(`${BASE_URL}/api/twilio/ivr/problem?call_id=${callId}&ivr_option=${optionDigit}`);
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Gather input="speech"
+          speechTimeout="auto"
+          timeout="7"
+          action="${actionUrl}"
+          method="POST">
+    <Say voice="alice">In a few words, please tell me your problem or query.</Say>
+  </Gather>
+  <Redirect method="POST">${actionUrl}&timeout=1</Redirect>
+</Response>`;
+}
+
+async function dialRoutedAgent(callId, route, problemSummary = "") {
+  saveIvrMessage(callId, `IVR_SELECTION:#${route.optionDigit || "-"} ${route.optionLabel}`);
+  saveIvrMessage(callId, `IVR_ROUTE:${route.queueLabel}`);
+  if (problemSummary) {
+    saveIvrMessage(callId, `IVR_SUMMARY:${problemSummary}`);
+  }
+
+  if (!twilioClient || !TWILIO_PHONE_NUMBER) {
+    console.warn("[voice] Twilio not configured — cannot route specific agent.");
+    return;
+  }
+
+  const agentUrl = `${BASE_URL}/api/twilio/agent?call_id=${callId}`;
+  const primaryIdentity = route.agentIdentity || "agent";
+
+  try {
+    const call = await twilioClient.calls.create({
+      to: `client:${primaryIdentity}`,
+      from: TWILIO_PHONE_NUMBER,
+      url: agentUrl,
+    });
+    saveIvrMessage(callId, `IVR_AGENT:client:${primaryIdentity}`);
+    console.log(`[voice] Routed agent call created ✓ SID=${call.sid} identity=client:${primaryIdentity}`);
+  } catch (err) {
+    console.error(`[voice] Routed agent dial FAILED (${primaryIdentity}): ${err.message}`);
+    try {
+      const fallback = await twilioClient.calls.create({
+        to: "client:agent",
+        from: TWILIO_PHONE_NUMBER,
+        url: agentUrl,
+      });
+      saveIvrMessage(callId, "IVR_AGENT:client:agent (fallback)");
+      console.log(`[voice] Fallback agent call created ✓ SID=${fallback.sid}`);
+    } catch (fallbackErr) {
+      console.error(`[voice] Fallback agent dial FAILED: ${fallbackErr.message}`);
+    }
+  }
+}
+
 function buildPhoneVariants(rawPhone) {
   const digitsOnly = String(rawPhone || "").replace(/\D/g, "");
   if (!digitsOnly) return [rawPhone].filter(Boolean);
@@ -163,6 +269,7 @@ function customerConferenceTwiml(callId) {
   <Dial>
     <Conference beep="false"
                 waitUrl="https://twimlets.com/holdmusic?Bucket=com.twilio.music.classical"
+                endConferenceOnExit="true"
                 statusCallbackEvent="end"
                 statusCallback="${statusUrl}">
       ${room}
@@ -183,7 +290,7 @@ function agentConferenceTwiml(callId) {
                    track="inbound_track" />
   </Start>
   <Dial>
-    <Conference beep="false" waitUrl="">
+    <Conference beep="false" waitUrl="" endConferenceOnExit="true">
       ${room}
     </Conference>
   </Dial>
@@ -249,35 +356,43 @@ app.post("/api/twilio/voice", async (req, res) => {
       else console.log(`[voice] Call inserted in DB ✓`);
     });
 
-    // Dial agent browser (laptop dashboard)
-    if (twilioClient && TWILIO_PHONE_NUMBER) {
-      const agentUrl = `${BASE_URL}/api/twilio/agent?call_id=${callId}`;
-      console.log(`[voice] Dialling agent → client:agent`);
-      console.log(`[voice] Agent TwiML URL : ${agentUrl}`);
-      twilioClient.calls.create({
-        to:   "client:agent",
-        from: TWILIO_PHONE_NUMBER,
-        url:  agentUrl,
-      }).then((call) => {
-        console.log(`[voice] Agent call created ✓ SID=${call.sid}`);
-      }).catch((err) => {
-        console.error(`[voice] Agent dial FAILED: ${err.message}`);
-        console.error(`[voice] Twilio error code : ${err.code || "n/a"}`);
-        console.error(`[voice] Twilio more info  : ${err.moreInfo || "n/a"}`);
-      });
-    } else {
-      console.warn("[voice] ERROR: Twilio client not configured — agent NOT dialled.");
-      console.warn(`[voice]   TWILIO_ACCOUNT_SID : ${TWILIO_ACCOUNT_SID ? "set" : "MISSING"}`);
-      console.warn(`[voice]   TWILIO_AUTH_TOKEN  : ${TWILIO_AUTH_TOKEN  ? "set" : "MISSING"}`);
-      console.warn(`[voice]   TWILIO_PHONE_NUMBER: ${TWILIO_PHONE_NUMBER ? "set" : "MISSING"}`);
-    }
-
-    res.send(customerConferenceTwiml(callId));
-    console.log(`[voice] Customer TwiML sent ✓`);
+    saveIvrMessage(callId, "IVR_START:Collecting menu selection and problem summary.");
+    res.send(buildIvrMenuTwiml(callId));
+    console.log(`[voice] IVR menu TwiML sent ✓`);
   } catch (error) {
     console.error("[voice] Unexpected error:", error.message);
-    res.send(customerConferenceTwiml(callId));
+    res.send(buildIvrMenuTwiml(callId));
   }
+});
+
+app.post("/api/twilio/ivr/select", (req, res) => {
+  res.set("Content-Type", "text/xml");
+  const callId = String(req.query.call_id || "").trim();
+  const digit = String(req.body.Digits || "").trim();
+  const option = IVR_OPTIONS[digit];
+
+  if (!callId) return res.send("<Response><Hangup/></Response>");
+  if (!option) return res.send(buildIvrMenuTwiml(callId, true));
+
+  console.log(`[ivr] callId=${callId} selected option=${digit} (${option.label})`);
+  saveIvrMessage(callId, `IVR_SELECTED:#${digit} ${option.label}`);
+  return res.send(buildProblemCaptureTwiml(callId, digit));
+});
+
+app.post("/api/twilio/ivr/problem", async (req, res) => {
+  res.set("Content-Type", "text/xml");
+  const callId = String(req.query.call_id || "").trim();
+  const ivrOption = String(req.query.ivr_option || "").trim();
+  const speech = String(req.body.SpeechResult || "").replace(/\s+/g, " ").trim();
+  const route = getRouteForOption(ivrOption);
+
+  if (!callId) return res.send("<Response><Hangup/></Response>");
+
+  const summary = speech || "No summary captured.";
+  console.log(`[ivr] callId=${callId} summary="${summary.slice(0, 120)}"`);
+
+  await dialRoutedAgent(callId, route, summary);
+  return res.send(customerConferenceTwiml(callId));
 });
 
 // -- Agent leg TwiML (called by Twilio when agent answers) ----
@@ -399,7 +514,13 @@ async function fetchCustomerBillingContext(customerId, customerPhone, customerNa
   try {
     let query = supabase.from("bills").select("*").order("created_at", { ascending: false }).limit(3);
     if (customerId)     query = query.eq("customer_id", customerId);
-    else if (customerPhone) query = query.or(`customer_phone.eq.${customerPhone},phone.eq.${customerPhone}`);
+    else if (customerPhone) {
+      const variants = buildPhoneVariants(customerPhone);
+      const phoneFilters = variants.map((v) => `customer_phone.eq.${v}`);
+      const altPhoneFilters = variants.map((v) => `phone.eq.${v}`);
+      const allFilters = [...phoneFilters, ...altPhoneFilters].join(",");
+      query = query.or(allFilters);
+    }
     else if (customerName)  query = query.ilike("customer_name", `%${customerName}%`);
     else return null;
 
@@ -439,7 +560,7 @@ async function fetchCustomerBillingContext(customerId, customerPhone, customerNa
         }
       : null;
 
-    return { summary, latestBill };
+    return { summary, latestBill, bills: data };
   } catch {
     return null;
   }
@@ -549,6 +670,7 @@ app.post("/api/transcription", async (req, res) => {
         tier,
         billingContext: billingInfo?.summary || null,
         latestBill: billingInfo?.latestBill || null,
+        bills: billingInfo?.bills || [],
       };
       const suggestedReply = await generateSuggestedReply(transcript, contextChunks, tier, customerData);
 
