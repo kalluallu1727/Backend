@@ -135,6 +135,7 @@ function getRouteForOption(optionDigit) {
 
 function buildIvrMenuTwiml(callId, retry = false) {
   const actionUrl = escapeXml(`${BASE_URL}/api/twilio/ivr/select?call_id=${callId}`);
+  const retryUrl = escapeXml(`${BASE_URL}/api/twilio/ivr/select?call_id=${callId}&retry=1`);
   const retryLine = retry ? `<Say voice="alice">Sorry, I did not get a valid option.</Say>` : "";
   return `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -149,12 +150,13 @@ function buildIvrMenuTwiml(callId, retry = false) {
     <Say voice="alice">Press 2 for new lines.</Say>
     <Say voice="alice">Press 3 for service related questions.</Say>
   </Gather>
-  <Redirect method="POST">${actionUrl}&retry=1</Redirect>
+  <Redirect method="POST">${retryUrl}</Redirect>
 </Response>`;
 }
 
 function buildProblemCaptureTwiml(callId, optionDigit) {
   const actionUrl = escapeXml(`${BASE_URL}/api/twilio/ivr/problem?call_id=${callId}&ivr_option=${optionDigit}`);
+  const timeoutUrl = escapeXml(`${BASE_URL}/api/twilio/ivr/problem?call_id=${callId}&ivr_option=${optionDigit}&timeout=1`);
   return `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Gather input="speech"
@@ -164,7 +166,7 @@ function buildProblemCaptureTwiml(callId, optionDigit) {
           method="POST">
     <Say voice="alice">In a few words, please tell me your problem or query.</Say>
   </Gather>
-  <Redirect method="POST">${actionUrl}&timeout=1</Redirect>
+  <Redirect method="POST">${timeoutUrl}</Redirect>
 </Response>`;
 }
 
