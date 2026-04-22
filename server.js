@@ -74,6 +74,8 @@ const AGENT_IDENTITIES = {
   "2": process.env.AGENT_IDENTITY_SUPPORT || "agent_support",
   "3": process.env.AGENT_IDENTITY_GENERAL || "agent",
 };
+const FALLBACK_AGENT_IDENTITY = process.env.AGENT_IDENTITY_FALLBACK || "agent";
+const ENABLE_SKILL_ROUTING = String(process.env.ENABLE_SKILL_ROUTING || "false").toLowerCase() === "true";
 const activeAgentCallByIdentity = new Map();
 const callAgentIdentityByCallId = new Map();
 
@@ -146,6 +148,7 @@ function ivrLabelFromDigit(digit) {
 }
 
 function getAgentIdentityFromOption(optionDigit) {
+  if (!ENABLE_SKILL_ROUTING) return FALLBACK_AGENT_IDENTITY;
   return AGENT_IDENTITIES[String(optionDigit || "").trim()] || AGENT_IDENTITIES["3"];
 }
 
@@ -169,26 +172,42 @@ function dialAgentForCall(callId, optionDigit) {
     return false;
   }
   const agentUrl = `${BASE_URL}/api/twilio/agent?call_id=${callId}&agent_identity=${encodeURIComponent(agentIdentity)}`;
+  const startDial = (identity) => {
+    activeAgentCallByIdentity.set(identity, callId);
+    callAgentIdentityByCallId.set(callId, identity);
+    saveIvrMessage(callId, `IVR_AGENT:client:${identity}`);
+    return twilioClient.calls.create({
+      to: `client:${identity}`,
+      from: TWILIO_PHONE_NUMBER,
+      url: `${BASE_URL}/api/twilio/agent?call_id=${callId}&agent_identity=${encodeURIComponent(identity)}`,
+    });
+  };
+
   console.log(`[voice] Dialling agent → client:${agentIdentity}`);
   console.log(`[voice] Agent TwiML URL : ${agentUrl}`);
-  activeAgentCallByIdentity.set(agentIdentity, callId);
-  callAgentIdentityByCallId.set(callId, agentIdentity);
-  saveIvrMessage(callId, `IVR_AGENT:client:${agentIdentity}`);
-  twilioClient.calls.create({
-    to:   `client:${agentIdentity}`,
-    from: TWILIO_PHONE_NUMBER,
-    url:  agentUrl,
-  }).then((call) => {
+  startDial(agentIdentity).then((call) => {
     console.log(`[voice] Agent call created ✓ SID=${call.sid}`);
   }).catch((err) => {
-    const mappedIdentity = callAgentIdentityByCallId.get(callId);
-    if (mappedIdentity && activeAgentCallByIdentity.get(mappedIdentity) === callId) {
-      activeAgentCallByIdentity.delete(mappedIdentity);
-      callAgentIdentityByCallId.delete(callId);
+    if (activeAgentCallByIdentity.get(agentIdentity) === callId) {
+      activeAgentCallByIdentity.delete(agentIdentity);
     }
-    console.error(`[voice] Agent dial FAILED: ${err.message}`);
+    callAgentIdentityByCallId.delete(callId);
+    console.error(`[voice] Agent dial FAILED (${agentIdentity}): ${err.message}`);
     console.error(`[voice] Twilio error code : ${err.code || "n/a"}`);
     console.error(`[voice] Twilio more info  : ${err.moreInfo || "n/a"}`);
+
+    if (FALLBACK_AGENT_IDENTITY === agentIdentity || isAgentIdentityBusy(FALLBACK_AGENT_IDENTITY, callId)) return;
+
+    console.log(`[voice] Attempting fallback agent identity client:${FALLBACK_AGENT_IDENTITY}`);
+    startDial(FALLBACK_AGENT_IDENTITY).then((fallbackCall) => {
+      console.log(`[voice] Fallback agent call created ✓ SID=${fallbackCall.sid}`);
+    }).catch((fallbackErr) => {
+      if (activeAgentCallByIdentity.get(FALLBACK_AGENT_IDENTITY) === callId) {
+        activeAgentCallByIdentity.delete(FALLBACK_AGENT_IDENTITY);
+      }
+      callAgentIdentityByCallId.delete(callId);
+      console.error(`[voice] Fallback agent dial FAILED (${FALLBACK_AGENT_IDENTITY}): ${fallbackErr.message}`);
+    });
   });
   return true;
 }
