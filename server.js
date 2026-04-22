@@ -69,7 +69,13 @@ const twilioClient =
     : null;
 
 const BASE_URL = (APP_BASE_URL || "").replace(/\/+$/, "");
-let activeAgentCallId = null;
+const AGENT_IDENTITIES = {
+  "1": process.env.AGENT_IDENTITY_BILLING || "agent_billing",
+  "2": process.env.AGENT_IDENTITY_SUPPORT || "agent_support",
+  "3": process.env.AGENT_IDENTITY_GENERAL || "agent",
+};
+const activeAgentCallByIdentity = new Map();
+const callAgentIdentityByCallId = new Map();
 
 const port          = Number(PORT) || 3000;
 const hasExplicitPort = Boolean(PORT);
@@ -139,9 +145,20 @@ function ivrLabelFromDigit(digit) {
   return "General";
 }
 
-function dialAgentForCall(callId) {
-  if (activeAgentCallId && activeAgentCallId !== callId) {
-    console.log(`[voice] Agent busy on call ${activeAgentCallId}; cannot dial ${callId} yet.`);
+function getAgentIdentityFromOption(optionDigit) {
+  return AGENT_IDENTITIES[String(optionDigit || "").trim()] || AGENT_IDENTITIES["3"];
+}
+
+function isAgentIdentityBusy(agentIdentity, callId) {
+  const activeCallId = activeAgentCallByIdentity.get(agentIdentity);
+  return Boolean(activeCallId && activeCallId !== callId);
+}
+
+function dialAgentForCall(callId, optionDigit) {
+  const agentIdentity = getAgentIdentityFromOption(optionDigit);
+  if (isAgentIdentityBusy(agentIdentity, callId)) {
+    const activeCallId = activeAgentCallByIdentity.get(agentIdentity);
+    console.log(`[voice] Agent ${agentIdentity} busy on call ${activeCallId}; cannot dial ${callId} yet.`);
     return false;
   }
   if (!twilioClient || !TWILIO_PHONE_NUMBER) {
@@ -151,18 +168,24 @@ function dialAgentForCall(callId) {
     console.warn(`[voice]   TWILIO_PHONE_NUMBER: ${TWILIO_PHONE_NUMBER ? "set" : "MISSING"}`);
     return false;
   }
-  const agentUrl = `${BASE_URL}/api/twilio/agent?call_id=${callId}`;
-  console.log(`[voice] Dialling agent → client:agent`);
+  const agentUrl = `${BASE_URL}/api/twilio/agent?call_id=${callId}&agent_identity=${encodeURIComponent(agentIdentity)}`;
+  console.log(`[voice] Dialling agent → client:${agentIdentity}`);
   console.log(`[voice] Agent TwiML URL : ${agentUrl}`);
-  activeAgentCallId = callId;
+  activeAgentCallByIdentity.set(agentIdentity, callId);
+  callAgentIdentityByCallId.set(callId, agentIdentity);
+  saveIvrMessage(callId, `IVR_AGENT:client:${agentIdentity}`);
   twilioClient.calls.create({
-    to:   "client:agent",
+    to:   `client:${agentIdentity}`,
     from: TWILIO_PHONE_NUMBER,
     url:  agentUrl,
   }).then((call) => {
     console.log(`[voice] Agent call created ✓ SID=${call.sid}`);
   }).catch((err) => {
-    if (activeAgentCallId === callId) activeAgentCallId = null;
+    const mappedIdentity = callAgentIdentityByCallId.get(callId);
+    if (mappedIdentity && activeAgentCallByIdentity.get(mappedIdentity) === callId) {
+      activeAgentCallByIdentity.delete(mappedIdentity);
+      callAgentIdentityByCallId.delete(callId);
+    }
     console.error(`[voice] Agent dial FAILED: ${err.message}`);
     console.error(`[voice] Twilio error code : ${err.code || "n/a"}`);
     console.error(`[voice] Twilio more info  : ${err.moreInfo || "n/a"}`);
@@ -170,16 +193,16 @@ function dialAgentForCall(callId) {
   return true;
 }
 
-function buildAgentWaitingTwiml(callId, waitCount = 0) {
+function buildAgentWaitingTwiml(callId, waitCount = 0, optionDigit = "3") {
   const nextCount = Number(waitCount || 0) + 1;
-  const loopUrl = escapeXml(`${BASE_URL}/api/twilio/wait-loop?call_id=${callId}&wait_count=${nextCount}`);
+  const loopUrl = escapeXml(`${BASE_URL}/api/twilio/wait-loop?call_id=${callId}&wait_count=${nextCount}&ivr_option=${optionDigit}`);
   const intro = waitCount === 0
     ? `<Say voice="alice">All our agents are currently helping other customers. Please stay on the line while we connect you.</Say>`
     : `<Say voice="alice">Thank you for waiting. We will connect you to the next available agent shortly.</Say>`;
   return `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   ${intro}
-  <Play>https://api.twilio.com/cowbell.mp3</Play>
+  <Play>https://com.twilio.music.classical.s3.amazonaws.com/BusyStrings.mp3</Play>
   <Pause length="3" />
   <Redirect method="POST">${loopUrl}</Redirect>
 </Response>`;
@@ -344,15 +367,17 @@ app.post("/api/twilio/wait-loop", (req, res) => {
   res.set("Content-Type", "text/xml");
   const callId = String(req.query.call_id || "").trim();
   const waitCount = Number(req.query.wait_count || 0);
+  const optionDigit = String(req.query.ivr_option || "3").trim();
   if (!callId) return res.send("<Response><Hangup/></Response>");
 
-  if (activeAgentCallId && activeAgentCallId !== callId) {
-    return res.send(buildAgentWaitingTwiml(callId, waitCount));
+  const targetIdentity = getAgentIdentityFromOption(optionDigit);
+  if (isAgentIdentityBusy(targetIdentity, callId)) {
+    return res.send(buildAgentWaitingTwiml(callId, waitCount, optionDigit));
   }
 
-  const dialStarted = dialAgentForCall(callId);
+  const dialStarted = dialAgentForCall(callId, optionDigit);
   if (!dialStarted) {
-    return res.send(buildAgentWaitingTwiml(callId, waitCount));
+    return res.send(buildAgentWaitingTwiml(callId, waitCount, optionDigit));
   }
   saveIvrMessage(callId, "IVR_WAITING:Agent became available. Connecting now.");
   return res.send(customerConferenceTwiml(callId));
@@ -383,8 +408,20 @@ app.post("/api/twilio/ivr/problem", (req, res) => {
   const summary = spoken || "No problem summary captured.";
   saveIvrMessage(callId, `IVR_SUMMARY:${summary}`);
   saveIvrMessage(callId, `IVR_SELECTION:#${optionDigit || "-"} ${ivrLabelFromDigit(optionDigit)}`);
-  saveIvrMessage(callId, "IVR_WAITING:Playing waiting message before agent connection.");
-  res.send(buildAgentWaitingTwiml(callId, 0));
+
+  // Connect immediately when no active call is using the agent.
+  // Only play waiting flow when the agent is actually busy.
+  const targetIdentity = getAgentIdentityFromOption(optionDigit);
+  if (!isAgentIdentityBusy(targetIdentity, callId)) {
+    const dialStarted = dialAgentForCall(callId, optionDigit);
+    if (dialStarted) {
+      saveIvrMessage(callId, `IVR_WAITING:Agent ${targetIdentity} available. Connecting now.`);
+      return res.send(customerConferenceTwiml(callId));
+    }
+  }
+
+  saveIvrMessage(callId, `IVR_WAITING:Agent ${targetIdentity} busy. Playing waiting message before connection.`);
+  return res.send(buildAgentWaitingTwiml(callId, 0, optionDigit));
 });
 
 // -- Agent leg TwiML (called by Twilio when agent answers) ----
@@ -494,7 +531,11 @@ app.post("/api/conference-status", (req, res) => {
   const event  = req.body.StatusCallbackEvent;
 
   if (event === "conference-end" && callId) {
-    if (activeAgentCallId === callId) activeAgentCallId = null;
+    const mappedIdentity = callAgentIdentityByCallId.get(callId);
+    if (mappedIdentity && activeAgentCallByIdentity.get(mappedIdentity) === callId) {
+      activeAgentCallByIdentity.delete(mappedIdentity);
+    }
+    callAgentIdentityByCallId.delete(callId);
     console.log(`Conference ended callId=${callId}`);
   }
 
