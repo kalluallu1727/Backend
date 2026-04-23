@@ -291,6 +291,7 @@ function customerConferenceTwiml(callId) {
   <Dial>
     <Conference beep="false"
                 waitUrl="https://twimlets.com/holdmusic?Bucket=com.twilio.music.classical"
+                endConferenceOnExit="true"
                 statusCallbackEvent="end"
                 statusCallback="${statusUrl}">
       ${room}
@@ -311,7 +312,7 @@ function agentConferenceTwiml(callId) {
                    track="inbound_track" />
   </Start>
   <Dial>
-    <Conference beep="false" waitUrl="">
+    <Conference beep="false" waitUrl="" endConferenceOnExit="true">
       ${room}
     </Conference>
   </Dial>
@@ -432,10 +433,10 @@ app.post("/api/twilio/ivr/problem", (req, res) => {
   if (!spoken) {
     const nextRetry = retryCount + 1;
     if (nextRetry <= 1) {
-      saveIvrMessage(callId, "IVR_SUMMARY:No input received. Re-prompting once.");
+      saveIvrMessage(callId, "IVR_EVENT:No input received. Re-prompting once.");
       return res.send(buildProblemCaptureTwiml(callId, optionDigit, nextRetry));
     }
-    saveIvrMessage(callId, "IVR_SUMMARY:No customer query captured after retry. Call disconnected.");
+    saveIvrMessage(callId, "IVR_EVENT:No customer query captured after retry. Call disconnected.");
     return res.send(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Say voice="alice">We did not receive your query. Please call again. Goodbye.</Say>
