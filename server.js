@@ -128,11 +128,15 @@ function buildIvrMenuTwiml(callId, isCustomerKnown, retry = false) {
 </Response>`;
 }
 
-function buildProblemCaptureTwiml(callId, optionDigit) {
-  const actionUrl = escapeXml(`${BASE_URL}/api/twilio/ivr/problem?call_id=${callId}&ivr_option=${optionDigit}`);
-  const timeoutUrl = escapeXml(`${BASE_URL}/api/twilio/ivr/problem?call_id=${callId}&ivr_option=${optionDigit}&timeout=1`);
+function buildProblemCaptureTwiml(callId, optionDigit, retryCount = 0) {
+  const actionUrl = escapeXml(`${BASE_URL}/api/twilio/ivr/problem?call_id=${callId}&ivr_option=${optionDigit}&retry_count=${retryCount}`);
+  const timeoutUrl = escapeXml(`${BASE_URL}/api/twilio/ivr/problem?call_id=${callId}&ivr_option=${optionDigit}&timeout=1&retry_count=${retryCount}`);
+  const retryPrompt = retryCount > 0
+    ? `<Say voice="alice">I have not received any input. Please tell your query or problem in a few words.</Say>`
+    : "";
   return `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
+  ${retryPrompt}
   <Gather input="speech" speechTimeout="auto" timeout="7" action="${actionUrl}" method="POST">
     <Say voice="alice">In a few words, please tell me your problem or query.</Say>
   </Gather>
@@ -421,10 +425,25 @@ app.post("/api/twilio/ivr/problem", (req, res) => {
   res.set("Content-Type", "text/xml");
   const callId = String(req.query.call_id || "").trim();
   const optionDigit = String(req.query.ivr_option || "").trim();
+  const retryCount = Number(req.query.retry_count || 0);
   const spoken = String(req.body.SpeechResult || "").replace(/\s+/g, " ").trim();
   if (!callId) return res.send("<Response><Hangup/></Response>");
 
-  const summary = spoken || "No problem summary captured.";
+  if (!spoken) {
+    const nextRetry = retryCount + 1;
+    if (nextRetry <= 1) {
+      saveIvrMessage(callId, "IVR_SUMMARY:No input received. Re-prompting once.");
+      return res.send(buildProblemCaptureTwiml(callId, optionDigit, nextRetry));
+    }
+    saveIvrMessage(callId, "IVR_SUMMARY:No customer query captured after retry. Call disconnected.");
+    return res.send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say voice="alice">We did not receive your query. Please call again. Goodbye.</Say>
+  <Hangup />
+</Response>`);
+  }
+
+  const summary = spoken || "No customer query captured.";
   saveIvrMessage(callId, `IVR_SUMMARY:${summary}`);
   saveIvrMessage(callId, `IVR_SELECTION:#${optionDigit || "-"} ${ivrLabelFromDigit(optionDigit)}`);
 
