@@ -487,8 +487,17 @@ app.get("/api/token", (_req, res) => {
 app.post("/api/twilio/voice", async (req, res) => {
   res.set("Content-Type", "text/xml");
 
+  // Browser SDK outbound calls have From=client:<identity>; they must NOT hit the IVR.
+  // Redirect to /api/twilio/outbound so the agent and customer go straight into a conference.
+  const fromRaw = String(req.body.From || req.body.Caller || "").trim();
+  if (fromRaw.startsWith("client:")) {
+    return res.send(
+      `<?xml version="1.0" encoding="UTF-8"?>\n<Response>\n  <Redirect method="POST">${escapeXml(`${BASE_URL}/api/twilio/outbound`)}</Redirect>\n</Response>`
+    );
+  }
+
   const callId      = randomUUID();
-  const callerPhone = String(req.body.From || req.body.Caller || "").trim() || null;
+  const callerPhone = fromRaw || null;
 
   console.log(`\n[voice] ── Incoming call ──────────────────────`);
   console.log(`[voice] callId       : ${callId}`);
@@ -707,10 +716,9 @@ app.post("/api/twilio/outbound", async (req, res) => {
     console.error("[recording] outbound createRecordingRow failed:", err.message)
   );
 
-  // Put agent into the conference room with transcription + recording
+  // Agent enters conference immediately (no recording yet — recording starts when customer joins).
   const agentTranscriptionUrl = escapeXml(`${BASE_URL}/api/transcription?call_id=${callId}&role=agent`);
   const statusUrl              = escapeXml(`${BASE_URL}/api/conference-status?call_id=${callId}`);
-  const recordingStatusUrl     = escapeXml(`${BASE_URL}/api/recording-status?call_id=${callId}`);
 
   res.send(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -723,10 +731,7 @@ app.post("/api/twilio/outbound", async (req, res) => {
     <Conference beep="false"
                 waitUrl="https://twimlets.com/holdmusic?Bucket=com.twilio.music.classical"
                 statusCallbackEvent="end"
-                statusCallback="${statusUrl}"
-                record="record-from-start"
-                recordingStatusCallback="${recordingStatusUrl}"
-                recordingStatusCallbackEvent="completed absent">
+                statusCallback="${statusUrl}">
       ${room}
     </Conference>
   </Dial>
@@ -740,9 +745,11 @@ app.post("/api/twilio/outbound-customer", (req, res) => {
   const callId = String(req.query.call_id || "").trim();
   if (!callId) return res.send("<Response><Hangup/></Response>");
 
-  const room                    = `room-${callId}`;
-  const customerTranscriptionUrl = escapeXml(`${BASE_URL}/api/transcription?call_id=${callId}&role=customer`);
+  const room                     = `room-${callId}`;
+  const customerTranscriptionUrl  = escapeXml(`${BASE_URL}/api/transcription?call_id=${callId}&role=customer`);
+  const recordingStatusUrl        = escapeXml(`${BASE_URL}/api/recording-status?call_id=${callId}`);
 
+  // Recording starts here — customer just answered, so both agent and customer are now connected.
   res.send(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Start>
@@ -751,7 +758,11 @@ app.post("/api/twilio/outbound-customer", (req, res) => {
                    track="inbound_track" />
   </Start>
   <Dial>
-    <Conference beep="false" waitUrl="">
+    <Conference beep="false"
+                waitUrl=""
+                record="record-from-start"
+                recordingStatusCallback="${recordingStatusUrl}"
+                recordingStatusCallbackEvent="completed absent">
       ${room}
     </Conference>
   </Dial>
