@@ -398,6 +398,80 @@ async function createRecordingRow(callId, agentId, callType) {
     .then(({ error: e }) => { if (e) console.error("[recording] calls.agent_id update:", e.message); });
 }
 
+// ── Outbound call handler (shared by /api/twilio/voice redirect + /api/twilio/outbound) ──
+// Awaits the calls insert before creating the recording row to satisfy the FK constraint.
+async function handleOutboundCall(req, res) {
+  res.set("Content-Type", "text/xml");
+  const to = String(req.body.To || "").trim();
+  const fromPhone = (TWILIO_PHONE_NUMBER || "").trim(); // trim whitespace from .env
+
+  if (!to || !fromPhone || !twilioClient) {
+    console.warn(`[outbound] Cannot start call — to=${to || "(empty)"} fromPhone=${fromPhone || "(empty)"} client=${twilioClient ? "ok" : "missing"}`);
+    return res.send("<Response><Hangup/></Response>");
+  }
+
+  const callId = randomUUID();
+  const room   = `room-${callId}`;
+
+  console.log(`\n[outbound] ── Outbound call ───────────────────`);
+  console.log(`[outbound] callId : ${callId}`);
+  console.log(`[outbound] to     : ${to}`);
+
+  // Await insert so the FK on call_recordings.call_id is satisfied before createRecordingRow runs.
+  const { error: callInsertErr } = await supabase.from("calls").insert({
+    id:             callId,
+    customer_phone: to,
+    customer_name:  null,
+    tier:           null,
+    priority:       "low",
+    call_type:      "outbound",
+    status:         "in_progress",
+  });
+  if (callInsertErr) console.error("[outbound] Call insert error:", callInsertErr.message);
+  else               console.log(`[outbound] Call inserted in DB ✓`);
+
+  // Enrich with customer profile asynchronously
+  lookupCustomerByPhone(to).then((customer) => {
+    if (!customer) return;
+    supabase.from("calls").update({ customer_name: customer.name, tier: customer.tier })
+      .eq("id", callId)
+      .then(({ error }) => { if (error) console.error("[outbound] Customer update error:", error.message); });
+  });
+
+  // Create recording row — safe now that the calls row exists
+  createRecordingRow(callId, FALLBACK_AGENT_IDENTITY, "outbound")
+    .catch((err) => console.error("[recording] outbound createRecordingRow failed:", err.message));
+
+  // Dial the customer via REST API; customer joins the same conference room
+  const customerUrl = `${BASE_URL}/api/twilio/outbound-customer?call_id=${callId}`;
+  twilioClient.calls.create({ to, from: fromPhone, url: customerUrl })
+    .then((call) => console.log(`[outbound] Customer dialed ✓ SID=${call.sid}`))
+    .catch((err) => console.error(`[outbound] Customer dial FAILED: ${err.message}`));
+
+  // Agent enters conference immediately; hold music plays until customer answers
+  const agentTranscriptionUrl = escapeXml(`${BASE_URL}/api/transcription?call_id=${callId}&role=agent`);
+  const statusUrl              = escapeXml(`${BASE_URL}/api/conference-status?call_id=${callId}`);
+
+  res.send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Start>
+    <Transcription statusCallbackUrl="${agentTranscriptionUrl}"
+                   statusCallbackMethod="POST"
+                   track="inbound_track" />
+  </Start>
+  <Dial>
+    <Conference beep="false"
+                waitUrl="https://twimlets.com/holdmusic?Bucket=com.twilio.music.classical"
+                endConferenceOnExit="true"
+                statusCallbackEvent="end"
+                statusCallback="${statusUrl}">
+      ${room}
+    </Conference>
+  </Dial>
+</Response>`);
+  console.log(`[outbound] Agent TwiML sent ✓`);
+}
+
 // ── Conference TwiML builders ─────────────────────────────────
 // Twilio's <Start><Transcription> handles speech-to-text natively.
 // Final transcripts are POSTed to /api/transcription by Twilio.
@@ -487,13 +561,10 @@ app.get("/api/token", (_req, res) => {
 app.post("/api/twilio/voice", async (req, res) => {
   res.set("Content-Type", "text/xml");
 
-  // Browser SDK outbound calls have From=client:<identity>; they must NOT hit the IVR.
-  // Redirect to /api/twilio/outbound so the agent and customer go straight into a conference.
+  // Browser SDK outbound calls have From=client:<identity>; route directly to outbound handler.
   const fromRaw = String(req.body.From || req.body.Caller || "").trim();
   if (fromRaw.startsWith("client:")) {
-    return res.send(
-      `<?xml version="1.0" encoding="UTF-8"?>\n<Response>\n  <Redirect method="POST">${escapeXml(`${BASE_URL}/api/twilio/outbound`)}</Redirect>\n</Response>`
-    );
+    return handleOutboundCall(req, res);
   }
 
   const callId      = randomUUID();
@@ -667,77 +738,7 @@ app.post("/api/twilio/agent", (req, res) => {
 });
 
 // -- Outbound call: agent leg (TwiML App calls this when agent dials) -
-app.post("/api/twilio/outbound", async (req, res) => {
-  res.set("Content-Type", "text/xml");
-  const to = String(req.body.To || "").trim();
-
-  if (!to || !TWILIO_PHONE_NUMBER || !twilioClient) {
-    return res.send("<Response><Hangup/></Response>");
-  }
-
-  const callId = randomUUID();
-  const room   = `room-${callId}`;
-
-  console.log(`\n[outbound] ── Outbound call ───────────────────`);
-  console.log(`[outbound] callId : ${callId}`);
-  console.log(`[outbound] to     : ${to}`);
-
-  // Insert call record then update with customer info if found
-  supabase.from("calls").insert({
-    id:             callId,
-    customer_phone: to,
-    customer_name:  null,
-    tier:           null,
-    priority:       "low",
-    call_type:      "outbound",
-    status:         "in_progress",
-  }).then(({ error }) => {
-    if (error) console.error("[outbound] Call insert error:", error.message);
-    else console.log(`[outbound] Call inserted in DB ✓`);
-  });
-
-  lookupCustomerByPhone(to).then((customer) => {
-    if (!customer) return;
-    supabase.from("calls").update({ customer_name: customer.name, tier: customer.tier })
-      .eq("id", callId).then(({ error }) => {
-        if (error) console.error("[outbound] Customer update error:", error.message);
-      });
-  });
-
-  // Dial the customer into the same conference room via REST API
-  const customerUrl = `${BASE_URL}/api/twilio/outbound-customer?call_id=${callId}`;
-  twilioClient.calls.create({ to, from: TWILIO_PHONE_NUMBER, url: customerUrl })
-    .then((call) => console.log(`[outbound] Customer dialed ✓ SID=${call.sid}`))
-    .catch((err) => console.error(`[outbound] Customer dial FAILED: ${err.message}`));
-
-  // Create recording row for this outbound call
-  const outboundAgentId = FALLBACK_AGENT_IDENTITY;
-  createRecordingRow(callId, outboundAgentId, "outbound").catch((err) =>
-    console.error("[recording] outbound createRecordingRow failed:", err.message)
-  );
-
-  // Agent enters conference immediately (no recording yet — recording starts when customer joins).
-  const agentTranscriptionUrl = escapeXml(`${BASE_URL}/api/transcription?call_id=${callId}&role=agent`);
-  const statusUrl              = escapeXml(`${BASE_URL}/api/conference-status?call_id=${callId}`);
-
-  res.send(`<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Start>
-    <Transcription statusCallbackUrl="${agentTranscriptionUrl}"
-                   statusCallbackMethod="POST"
-                   track="inbound_track" />
-  </Start>
-  <Dial>
-    <Conference beep="false"
-                waitUrl="https://twimlets.com/holdmusic?Bucket=com.twilio.music.classical"
-                statusCallbackEvent="end"
-                statusCallback="${statusUrl}">
-      ${room}
-    </Conference>
-  </Dial>
-</Response>`);
-  console.log(`[outbound] Agent TwiML sent ✓`);
-});
+app.post("/api/twilio/outbound", (req, res) => handleOutboundCall(req, res));
 
 // -- Outbound call: customer leg (Twilio calls this when customer answers) -
 app.post("/api/twilio/outbound-customer", (req, res) => {
@@ -760,6 +761,7 @@ app.post("/api/twilio/outbound-customer", (req, res) => {
   <Dial>
     <Conference beep="false"
                 waitUrl=""
+                endConferenceOnExit="true"
                 record="record-from-start"
                 recordingStatusCallback="${recordingStatusUrl}"
                 recordingStatusCallbackEvent="completed absent">
