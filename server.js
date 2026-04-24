@@ -430,12 +430,20 @@ async function handleOutboundCall(req, res) {
   if (callInsertErr) console.error("[outbound] Call insert error:", callInsertErr.message);
   else               console.log(`[outbound] Call inserted in DB ✓`);
 
-  // Enrich with customer profile asynchronously
+  // Save outbound context so Dashboard conversation pane shows something immediately
+  saveIvrMessage(callId, `IVR_SUMMARY:Outbound call to ${to}`);
+
+  // Enrich with customer profile asynchronously; also update the context message with name
   lookupCustomerByPhone(to).then((customer) => {
     if (!customer) return;
     supabase.from("calls").update({ customer_name: customer.name, tier: customer.tier })
       .eq("id", callId)
       .then(({ error }) => { if (error) console.error("[outbound] Customer update error:", error.message); });
+    // Update the outbound context message with the customer name once resolved
+    supabase.from("messages")
+      .update({ content: `IVR_SUMMARY:Outbound call to ${customer.name} (${customer.tier || "Customer"})` })
+      .eq("call_id", callId).eq("role", "ivr").like("content", "IVR_SUMMARY:Outbound call to%")
+      .then(({ error: e }) => { if (e) console.error("[outbound] Context msg update:", e.message); });
   });
 
   // Create recording row — safe now that the calls row exists
