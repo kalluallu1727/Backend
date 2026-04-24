@@ -99,6 +99,101 @@ function escapeXml(value) {
     .replace(/'/g, "&apos;");
 }
 
+// ── Context-aware routing helpers ─────────────────────────────
+
+// Pick the best agent identity using AI-derived intent, emotion, and customer tier.
+// When ENABLE_SKILL_ROUTING=false all calls go to FALLBACK_AGENT_IDENTITY — context is
+// still analysed and stored for display, but the dial target is not changed.
+function selectAgentByContext(intent, emotion, tier, dtmfDigit) {
+  if (!ENABLE_SKILL_ROUTING) {
+    return {
+      agentIdentity: FALLBACK_AGENT_IDENTITY,
+      reason: `IVR selection: ${ivrLabelFromDigit(dtmfDigit)} (skill routing off)`,
+    };
+  }
+
+  const tierLower    = String(tier || "").toLowerCase();
+  const isHighTier   = tierLower === "platinum" || tierLower === "gold";
+  const isDistressed = emotion === "angry" || emotion === "frustrated";
+
+  // Escalation: high-tier customer in distress → senior/fallback agent
+  if (isHighTier && isDistressed) {
+    return {
+      agentIdentity: FALLBACK_AGENT_IDENTITY,
+      reason: `Escalated: ${tier} customer (${emotion}) → senior agent`,
+    };
+  }
+
+  const BILLING_INTENTS = ["billing_issue", "payment_issue", "refund_request"];
+  const SUPPORT_INTENTS = ["technical_support", "cancellation", "complaint"];
+
+  if (BILLING_INTENTS.includes(intent)) {
+    return { agentIdentity: AGENT_IDENTITIES["1"], reason: `Intent: ${intent} → billing agent` };
+  }
+  if (SUPPORT_INTENTS.includes(intent)) {
+    return { agentIdentity: AGENT_IDENTITIES["2"], reason: `Intent: ${intent} → support agent` };
+  }
+
+  // Respect the customer's DTMF selection as final fallback
+  return {
+    agentIdentity: AGENT_IDENTITIES[String(dtmfDigit)] || FALLBACK_AGENT_IDENTITY,
+    reason: `IVR selection: ${ivrLabelFromDigit(dtmfDigit)}`,
+  };
+}
+
+// analyzeCustomerSpeech with a hard timeout; returns a safe default on timeout/error.
+function analyzeWithTimeout(spoken, tier, timeoutMs = 3000) {
+  return Promise.race([
+    analyzeCustomerSpeech(spoken, tier),
+    new Promise((resolve) =>
+      setTimeout(
+        () => resolve({ emotion: "calm", intent: "general_inquiry", priority: "low", suggested_actions: [] }),
+        timeoutMs
+      )
+    ),
+  ]);
+}
+
+// Run analysis, store routing context in the map, and save an IVR_ROUTING message.
+// Called async after TwiML has already been sent to Twilio.
+async function buildRoutingContext(callId, spoken, tier, dtmfDigit) {
+  try {
+    const analysis = await analyzeWithTimeout(spoken, tier, 3000);
+    const { agentIdentity, reason } = selectAgentByContext(
+      analysis.intent, analysis.emotion, tier, dtmfDigit
+    );
+
+    callRoutingContext.set(callId, {
+      agentIdentity,
+      reason,
+      intent:   analysis.intent,
+      emotion:  analysis.emotion,
+      priority: analysis.priority,
+    });
+
+    saveIvrMessage(
+      callId,
+      `IVR_ROUTING:${JSON.stringify({
+        intent:   analysis.intent,
+        emotion:  analysis.emotion,
+        priority: analysis.priority,
+        agent:    agentIdentity,
+        reason,
+      })}`
+    );
+
+    supabase.from("calls").update({ priority: analysis.priority }).eq("id", callId)
+      .then(({ error: e }) => { if (e) console.error("[routing] priority update:", e.message); });
+
+    console.log(`[routing] callId=${callId} intent=${analysis.intent} emotion=${analysis.emotion} priority=${analysis.priority} → ${agentIdentity} | ${reason}`);
+    return { analysis, agentIdentity, reason };
+  } catch (err) {
+    console.error("[routing] buildRoutingContext failed:", err.message);
+    const agentIdentity = AGENT_IDENTITIES[String(dtmfDigit)] || FALLBACK_AGENT_IDENTITY;
+    return { analysis: null, agentIdentity, reason: "Fallback (analysis failed)" };
+  }
+}
+
 function saveIvrMessage(callId, content) {
   const text = String(content || "").trim();
   if (!callId || !text) return;
@@ -164,8 +259,8 @@ function isAgentIdentityBusy(agentIdentity, callId) {
   return Boolean(activeCallId && activeCallId !== callId);
 }
 
-function dialAgentForCall(callId, optionDigit) {
-  const agentIdentity = getAgentIdentityFromOption(optionDigit);
+function dialAgentForCall(callId, optionDigit, overrideIdentity = null) {
+  const agentIdentity = overrideIdentity || getAgentIdentityFromOption(optionDigit);
   if (isAgentIdentityBusy(agentIdentity, callId)) {
     const activeCallId = activeAgentCallByIdentity.get(agentIdentity);
     console.log(`[voice] Agent ${agentIdentity} busy on call ${activeCallId}; cannot dial ${callId} yet.`);
@@ -431,17 +526,20 @@ app.post("/api/twilio/voice", async (req, res) => {
 
 app.post("/api/twilio/wait-loop", (req, res) => {
   res.set("Content-Type", "text/xml");
-  const callId = String(req.query.call_id || "").trim();
-  const waitCount = Number(req.query.wait_count || 0);
+  const callId      = String(req.query.call_id    || "").trim();
+  const waitCount   = Number(req.query.wait_count || 0);
   const optionDigit = String(req.query.ivr_option || "3").trim();
   if (!callId) return res.send("<Response><Hangup/></Response>");
 
-  const targetIdentity = getAgentIdentityFromOption(optionDigit);
+  // Use context-aware routing if analysis has already completed for this call
+  const routingCtx     = callRoutingContext.get(callId);
+  const targetIdentity = routingCtx?.agentIdentity || getAgentIdentityFromOption(optionDigit);
+
   if (isAgentIdentityBusy(targetIdentity, callId)) {
     return res.send(buildAgentWaitingTwiml(callId, waitCount, optionDigit));
   }
 
-  const dialStarted = dialAgentForCall(callId, optionDigit);
+  const dialStarted = dialAgentForCall(callId, optionDigit, routingCtx?.agentIdentity || null);
   if (!dialStarted) {
     return res.send(buildAgentWaitingTwiml(callId, waitCount, optionDigit));
   }
@@ -464,12 +562,12 @@ app.post("/api/twilio/ivr/select", (req, res) => {
   res.send(buildProblemCaptureTwiml(callId, digit));
 });
 
-app.post("/api/twilio/ivr/problem", (req, res) => {
+app.post("/api/twilio/ivr/problem", async (req, res) => {
   res.set("Content-Type", "text/xml");
-  const callId = String(req.query.call_id || "").trim();
+  const callId      = String(req.query.call_id    || "").trim();
   const optionDigit = String(req.query.ivr_option || "").trim();
-  const retryCount = Number(req.query.retry_count || 0);
-  const spoken = String(req.body.SpeechResult || "").replace(/\s+/g, " ").trim();
+  const retryCount  = Number(req.query.retry_count || 0);
+  const spoken      = String(req.body.SpeechResult || "").replace(/\s+/g, " ").trim();
   if (!callId) return res.send("<Response><Hangup/></Response>");
 
   if (!spoken) {
@@ -486,22 +584,55 @@ app.post("/api/twilio/ivr/problem", (req, res) => {
 </Response>`);
   }
 
-  const summary = spoken || "No customer query captured.";
-  saveIvrMessage(callId, `IVR_SUMMARY:${summary}`);
+  saveIvrMessage(callId, `IVR_SUMMARY:${spoken}`);
   saveIvrMessage(callId, `IVR_SELECTION:#${optionDigit || "-"} ${ivrLabelFromDigit(optionDigit)}`);
 
-  // Connect immediately when no active call is using the agent.
-  // Only play waiting flow when the agent is actually busy.
-  const targetIdentity = getAgentIdentityFromOption(optionDigit);
-  if (!isAgentIdentityBusy(targetIdentity, callId)) {
-    const dialStarted = dialAgentForCall(callId, optionDigit);
-    if (dialStarted) {
-      saveIvrMessage(callId, `IVR_WAITING:Agent ${targetIdentity} available. Connecting now.`);
-      return res.send(customerConferenceTwiml(callId));
-    }
+  // Fetch customer tier for AI analysis (lightweight — falls back to Regular)
+  let tier = "Regular";
+  try {
+    const { data: callRow } = await supabase.from("calls").select("tier").eq("id", callId).maybeSingle();
+    tier = callRow?.tier || "Regular";
+  } catch { /* use default */ }
+
+  // ── Context-aware routing ─────────────────────────────────────────────────
+  // Check availability against the DTMF-default identity before deciding path.
+  const defaultIdentity = getAgentIdentityFromOption(optionDigit);
+  const agentBusy = isAgentIdentityBusy(defaultIdentity, callId);
+
+  if (!agentBusy) {
+    // Send conference TwiML immediately so customer hears hold music right away.
+    res.send(customerConferenceTwiml(callId));
+
+    // Async: analyse speech → select best agent → dial (max 3 s analysis budget).
+    buildRoutingContext(callId, spoken, tier, optionDigit)
+      .then(({ agentIdentity }) => {
+        if (!isAgentIdentityBusy(agentIdentity, callId)) {
+          const started = dialAgentForCall(callId, optionDigit, agentIdentity);
+          saveIvrMessage(callId, started
+            ? `IVR_WAITING:Connecting to agent (context-based routing).`
+            : `IVR_WAITING:Agent unavailable — please wait.`
+          );
+        } else {
+          // Preferred agent became busy while analysis ran — try fallback
+          const fallbackStarted = dialAgentForCall(callId, optionDigit, FALLBACK_AGENT_IDENTITY);
+          saveIvrMessage(callId, fallbackStarted
+            ? `IVR_WAITING:Preferred agent busy — routing to next available agent.`
+            : `IVR_WAITING:All agents busy — please wait.`
+          );
+        }
+      })
+      .catch((err) => {
+        console.error("[routing] Async dial error:", err.message);
+        dialAgentForCall(callId, optionDigit);
+      });
+    return;
   }
 
-  saveIvrMessage(callId, `IVR_WAITING:Agent ${targetIdentity} busy. Playing waiting message before connection.`);
+  // Agent busy path — run analysis in background so routing context is stored
+  // for when the wait-loop eventually fires dialAgentForCall.
+  saveIvrMessage(callId, `IVR_WAITING:Agent busy. Please hold while we connect you.`);
+  buildRoutingContext(callId, spoken, tier, optionDigit)
+    .catch((err) => console.error("[routing] Background analysis error:", err.message));
   return res.send(buildAgentWaitingTwiml(callId, 0, optionDigit));
 });
 
@@ -640,6 +771,7 @@ app.post("/api/conference-status", (req, res) => {
       activeAgentCallByIdentity.delete(mappedIdentity);
     }
     callAgentIdentityByCallId.delete(callId);
+    callRoutingContext.delete(callId);
     console.log(`Conference ended callId=${callId}`);
 
     // Mark call as completed
