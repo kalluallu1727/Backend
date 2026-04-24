@@ -11,6 +11,7 @@
 
 const express  = require("express");
 const http     = require("http");
+const https    = require("https");
 const { randomUUID } = require("crypto");
 const cors     = require("cors");
 const { createClient } = require("@supabase/supabase-js");
@@ -78,6 +79,8 @@ const FALLBACK_AGENT_IDENTITY = process.env.AGENT_IDENTITY_FALLBACK || "agent";
 const ENABLE_SKILL_ROUTING = String(process.env.ENABLE_SKILL_ROUTING || "false").toLowerCase() === "true";
 const activeAgentCallByIdentity = new Map();
 const callAgentIdentityByCallId = new Map();
+// callId → { agentIdentity, reason, intent, emotion, priority }
+const callRoutingContext = new Map();
 
 const port          = Number(PORT) || 3000;
 const hasExplicitPort = Boolean(PORT);
@@ -271,6 +274,35 @@ async function lookupCustomerByPhone(rawPhone) {
   return data || null;
 }
 
+// Creates a call_recordings row when the agent joins, and back-fills customer_id.
+async function createRecordingRow(callId, agentId, callType) {
+  const { data: callData } = await supabase
+    .from("calls").select("customer_phone").eq("id", callId).maybeSingle();
+
+  let customerId = null;
+  if (callData?.customer_phone) {
+    const customer = await lookupCustomerByPhone(callData.customer_phone);
+    customerId = customer?.id || null;
+  }
+
+  const { error } = await supabase.from("call_recordings").insert({
+    call_id:    callId,
+    customer_id: customerId,
+    agent_id:   agentId,
+    call_type:  callType,
+    status:     "in_progress",
+    started_at: new Date().toISOString(),
+  });
+
+  if (error) console.error("[recording] Insert error:", error.message);
+  else       console.log(`[recording] Row created ✓ callId=${callId} agent=${agentId}`);
+
+  // Tag the call record with the serving agent
+  supabase.from("calls").update({ agent_id: agentId })
+    .eq("id", callId)
+    .then(({ error: e }) => { if (e) console.error("[recording] calls.agent_id update:", e.message); });
+}
+
 // ── Conference TwiML builders ─────────────────────────────────
 // Twilio's <Start><Transcription> handles speech-to-text natively.
 // Final transcripts are POSTed to /api/transcription by Twilio.
@@ -300,9 +332,12 @@ function customerConferenceTwiml(callId) {
 </Response>`;
 }
 
+// Recording starts only when the agent joins (record-from-start on agent TwiML).
+// IVR audio and the customer-alone waiting phase are NOT captured.
 function agentConferenceTwiml(callId) {
-  const transcriptionUrl = escapeXml(`${BASE_URL}/api/transcription?call_id=${callId}&role=agent`);
-  const room             = `room-${callId}`;
+  const transcriptionUrl   = escapeXml(`${BASE_URL}/api/transcription?call_id=${callId}&role=agent`);
+  const recordingStatusUrl = escapeXml(`${BASE_URL}/api/recording-status?call_id=${callId}`);
+  const room               = `room-${callId}`;
 
   return `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -312,7 +347,12 @@ function agentConferenceTwiml(callId) {
                    track="inbound_track" />
   </Start>
   <Dial>
-    <Conference beep="false" waitUrl="" endConferenceOnExit="true">
+    <Conference beep="false"
+                waitUrl=""
+                endConferenceOnExit="true"
+                record="record-from-start"
+                recordingStatusCallback="${recordingStatusUrl}"
+                recordingStatusCallbackEvent="completed absent">
       ${room}
     </Conference>
   </Dial>
@@ -373,6 +413,8 @@ app.post("/api/twilio/voice", async (req, res) => {
       customer_name:  customer?.name  || null,
       tier:           customer?.tier  || null,
       priority:       "low",
+      call_type:      "inbound",
+      status:         "in_progress",
     }).then(({ error }) => {
       if (error) console.error("[voice] Call insert error:", error.message);
       else console.log(`[voice] Call inserted in DB ✓`);
@@ -467,10 +509,19 @@ app.post("/api/twilio/ivr/problem", (req, res) => {
 app.post("/api/twilio/agent", (req, res) => {
   res.set("Content-Type", "text/xml");
 
-  const callId = String(req.query.call_id || "").trim();
-  if (!callId) {
-    return res.send("<Response><Hangup/></Response>");
-  }
+  const callId       = String(req.query.call_id       || "").trim();
+  const agentIdentity = String(
+    req.query.agent_identity ||
+    callAgentIdentityByCallId.get(callId) ||
+    FALLBACK_AGENT_IDENTITY
+  ).trim();
+
+  if (!callId) return res.send("<Response><Hangup/></Response>");
+
+  // Create recording row before TwiML is processed so the dashboard shows "in progress" immediately.
+  createRecordingRow(callId, agentIdentity, "inbound").catch((err) =>
+    console.error("[recording] createRecordingRow failed:", err.message)
+  );
 
   res.send(agentConferenceTwiml(callId));
 });
@@ -498,6 +549,8 @@ app.post("/api/twilio/outbound", async (req, res) => {
     customer_name:  null,
     tier:           null,
     priority:       "low",
+    call_type:      "outbound",
+    status:         "in_progress",
   }).then(({ error }) => {
     if (error) console.error("[outbound] Call insert error:", error.message);
     else console.log(`[outbound] Call inserted in DB ✓`);
@@ -517,9 +570,16 @@ app.post("/api/twilio/outbound", async (req, res) => {
     .then((call) => console.log(`[outbound] Customer dialed ✓ SID=${call.sid}`))
     .catch((err) => console.error(`[outbound] Customer dial FAILED: ${err.message}`));
 
-  // Put agent into the conference room with transcription
+  // Create recording row for this outbound call
+  const outboundAgentId = FALLBACK_AGENT_IDENTITY;
+  createRecordingRow(callId, outboundAgentId, "outbound").catch((err) =>
+    console.error("[recording] outbound createRecordingRow failed:", err.message)
+  );
+
+  // Put agent into the conference room with transcription + recording
   const agentTranscriptionUrl = escapeXml(`${BASE_URL}/api/transcription?call_id=${callId}&role=agent`);
   const statusUrl              = escapeXml(`${BASE_URL}/api/conference-status?call_id=${callId}`);
+  const recordingStatusUrl     = escapeXml(`${BASE_URL}/api/recording-status?call_id=${callId}`);
 
   res.send(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -532,7 +592,10 @@ app.post("/api/twilio/outbound", async (req, res) => {
     <Conference beep="false"
                 waitUrl="https://twimlets.com/holdmusic?Bucket=com.twilio.music.classical"
                 statusCallbackEvent="end"
-                statusCallback="${statusUrl}">
+                statusCallback="${statusUrl}"
+                record="record-from-start"
+                recordingStatusCallback="${recordingStatusUrl}"
+                recordingStatusCallbackEvent="completed absent">
       ${room}
     </Conference>
   </Dial>
@@ -566,6 +629,8 @@ app.post("/api/twilio/outbound-customer", (req, res) => {
 
 // -- Conference status callback (called when conference ends) -
 app.post("/api/conference-status", (req, res) => {
+  res.status(200).end();
+
   const callId = String(req.query.call_id || "").trim();
   const event  = req.body.StatusCallbackEvent;
 
@@ -576,9 +641,143 @@ app.post("/api/conference-status", (req, res) => {
     }
     callAgentIdentityByCallId.delete(callId);
     console.log(`Conference ended callId=${callId}`);
+
+    // Mark call as completed
+    const now = new Date().toISOString();
+    supabase.from("calls")
+      .update({ status: "completed", ended_at: now })
+      .eq("id", callId)
+      .then(({ error }) => { if (error) console.error("[conference] calls update error:", error.message); });
+
+    // If the recording webhook hasn't arrived yet, mark the row as a safety net
+    // (the /api/recording-status webhook will overwrite this with real data)
+    supabase.from("call_recordings")
+      .update({ ended_at: now })
+      .eq("call_id", callId)
+      .eq("status", "in_progress")
+      .then(({ error }) => { if (error) console.error("[conference] recording update error:", error.message); });
+  }
+});
+
+// -- Recording status webhook (Twilio fires this when recording is ready) -
+app.post("/api/recording-status", async (req, res) => {
+  res.status(200).end();
+
+  const callId        = String(req.query.call_id      || "").trim();
+  const recordingSid  = String(req.body.RecordingSid  || "").trim();
+  const recordingUrl  = String(req.body.RecordingUrl  || "").trim();
+  const recordingStatus = String(req.body.RecordingStatus || "").trim(); // completed | absent | failed
+  const durationRaw   = String(req.body.RecordingDuration || "").trim();
+  const duration      = durationRaw ? parseInt(durationRaw, 10) : null;
+
+  console.log(`[recording] Webhook: callId=${callId} sid=${recordingSid} status=${recordingStatus} dur=${duration}`);
+
+  if (!callId || !recordingSid) {
+    console.warn("[recording] Missing call_id or RecordingSid — skipping");
+    return;
   }
 
-  res.status(200).end();
+  const dbStatus = recordingStatus === "completed" ? "completed"
+                 : recordingStatus === "absent"    ? "absent"
+                 : "failed";
+
+  const { error } = await supabase.from("call_recordings").update({
+    recording_sid:    recordingSid,
+    recording_url:    recordingUrl || null,
+    status:           dbStatus,
+    ended_at:         new Date().toISOString(),
+    duration_seconds: Number.isNaN(duration) ? null : duration,
+  }).eq("call_id", callId).eq("status", "in_progress");
+
+  if (error) console.error("[recording] Update error:", error.message);
+  else       console.log(`[recording] Updated to ${dbStatus} ✓ sid=${recordingSid}`);
+});
+
+// -- List recordings (with call + IVR context) ----------------
+app.get("/api/recordings", async (req, res) => {
+  const callId = String(req.query.call_id || "").trim();
+
+  let query = supabase
+    .from("call_recordings")
+    .select("*, calls(customer_name, customer_phone, tier, priority, call_type, status, created_at, ended_at)")
+    .order("started_at", { ascending: false })
+    .limit(100);
+
+  if (callId) query = query.eq("call_id", callId);
+
+  const { data, error } = await query;
+  if (error) return res.status(500).json({ error: error.message });
+
+  // Attach the IVR summary message so the dashboard can show it without extra queries
+  const recordings = await Promise.all((data || []).map(async (rec) => {
+    const { data: msgRow } = await supabase
+      .from("messages")
+      .select("content")
+      .eq("call_id", rec.call_id)
+      .eq("role", "ivr")
+      .like("content", "IVR_SUMMARY:%")
+      .limit(1)
+      .maybeSingle();
+
+    return {
+      ...rec,
+      ivr_summary: msgRow?.content
+        ? msgRow.content.slice("IVR_SUMMARY:".length).trim()
+        : null,
+    };
+  }));
+
+  return res.json({ recordings });
+});
+
+// -- Audio proxy: streams Twilio recording to client ----------
+// Keeps TWILIO_AUTH_TOKEN server-side; browser never sees credentials.
+app.get("/api/recordings/:callId/audio", async (req, res) => {
+  if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) {
+    return res.status(503).json({ error: "Twilio credentials not configured." });
+  }
+
+  const { callId } = req.params;
+  const { data, error } = await supabase
+    .from("call_recordings")
+    .select("recording_url, status")
+    .eq("call_id", callId)
+    .eq("status", "completed")
+    .maybeSingle();
+
+  if (error || !data?.recording_url) {
+    return res.status(404).json({ error: "Recording not found or not yet available." });
+  }
+
+  const audioUrl = `${data.recording_url}.mp3`;
+  const parsed   = new URL(audioUrl);
+
+  const options = {
+    hostname: parsed.hostname,
+    path:     parsed.pathname + parsed.search,
+    method:   "GET",
+    headers:  {
+      Authorization: `Basic ${Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString("base64")}`,
+    },
+  };
+  if (req.headers.range) options.headers.Range = req.headers.range;
+
+  const proxyReq = https.request(options, (proxyRes) => {
+    res.set("Content-Type",  proxyRes.headers["content-type"]  || "audio/mpeg");
+    res.set("Accept-Ranges", "bytes");
+    if (proxyRes.headers["content-length"]) res.set("Content-Length", proxyRes.headers["content-length"]);
+    if (proxyRes.headers["content-range"])  res.set("Content-Range",  proxyRes.headers["content-range"]);
+    if (proxyRes.headers["cache-control"])  res.set("Cache-Control",  proxyRes.headers["cache-control"]);
+    res.status(proxyRes.statusCode);
+    proxyRes.pipe(res);
+  });
+
+  proxyReq.on("error", (err) => {
+    console.error("[recording] Audio proxy error:", err.message);
+    if (!res.headersSent) res.status(502).json({ error: "Audio fetch failed." });
+  });
+
+  proxyReq.end();
 });
 
 // -- Fetch customer's recent bills from DB (graceful — works even if table missing) --
